@@ -1,0 +1,127 @@
+module Note exposing
+    ( Note
+    , getAllNotes
+    , getNote
+    , createNote
+    , updateNote
+    , deleteNote
+    )
+
+import Array exposing (Array)
+import Db
+import Db.Decode as Decode
+import Db.Encode as Encode
+import Task exposing (Task)
+
+
+type alias Note =
+    { id : Int
+    , title : String
+    , body : String
+    , createdAt : Int
+    , updatedAt : Int
+    }
+
+
+
+-- READ
+
+
+getAllNotes : Db.Connection -> Task Db.Error (Array Note)
+getAllNotes connection =
+    Db.getAll connection
+        { query =
+            """
+            SELECT id, title, body, created_at, updated_at
+            FROM notes
+            ORDER BY updated_at DESC
+            """
+        , parameters = []
+        , decoder = noteDecoder
+        }
+
+
+getNote : Db.Connection -> Int -> Task Db.Error (Maybe Note)
+getNote connection id =
+    Db.getMaybeOne connection
+        { query = "SELECT id, title, body, created_at, updated_at FROM notes WHERE id = :id"
+        , parameters = [ Encode.int "id" id ]
+        , decoder = noteDecoder
+        }
+
+
+
+-- WRITE
+
+
+createNote :
+    Db.Connection
+    ->
+        { title : String
+        , body : String
+        , createdAt : Int
+        , updatedAt : Int
+        }
+    -> Task Db.Error {}
+createNote connection newNote =
+    Db.execute connection
+        { statement = "INSERT INTO notes (title, body, created_at, updated_at) VALUES (:title, :body, :created_at, :updated_at)"
+        , parameters =
+            [ Encode.string "title" newNote.title
+            , Encode.string "body" newNote.body
+            , Encode.int "created_at" newNote.createdAt
+            , Encode.int "updated_at" newNote.updatedAt
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+updateNote :
+    Db.Connection
+    ->
+        { id : Int
+        , title : String
+        , body : String
+        , updatedAt : Int
+        }
+    -> Task Db.Error {}
+updateNote connection note =
+    Db.execute connection
+        { statement = "UPDATE notes SET title = :title, body = :body, updated_at = :updated_at WHERE id = :id"
+        , parameters =
+            [ Encode.int "id" note.id
+            , Encode.string "title" note.title
+            , Encode.string "body" note.body
+            , Encode.int "updated_at" note.updatedAt
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+deleteNote : Db.Connection -> Int -> Task Db.Error {}
+deleteNote connection id =
+    Db.execute connection
+        { statement = "DELETE FROM notes WHERE id = :id"
+        , parameters = [ Encode.int "id" id ]
+        }
+        |> Task.map (\_ -> {})
+
+
+
+-- DECODER
+
+
+noteDecoder : Decode.Decoder Note
+noteDecoder =
+    Decode.field Decode.int "id" <| \id ->
+    Decode.field Decode.string "title" <| \title ->
+    Decode.field Decode.string "body" <| \body ->
+    Decode.field Decode.int "created_at" <| \createdAt ->
+    Decode.field Decode.int "updated_at" <| \updatedAt ->
+    Decode.succeed
+        { id = id
+        , title = title
+        , body = body
+        , createdAt = createdAt
+        , updatedAt = updatedAt
+        }

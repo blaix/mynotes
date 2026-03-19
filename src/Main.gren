@@ -1,0 +1,875 @@
+module Main exposing (main)
+
+import Array exposing (Array)
+import Bytes
+import Db
+import Dict exposing (Dict)
+import HttpClient
+import HttpServer exposing (Request, Server)
+import HttpServer.Response as Response exposing (Response)
+import Init
+import Node exposing (Environment)
+import Note exposing (Note)
+import Stream.Log
+import Task
+import Time
+import Transmutable.Html as H exposing (Html)
+import Transmutable.Html.Attributes as A
+import Url
+
+
+main : Node.Program Model Msg
+main =
+    Node.defineProgram
+        { init = init
+        , update = update
+        , subscriptions = subscriptions
+        }
+
+
+
+-- MODEL
+
+
+type alias Model =
+    { server : Maybe Server
+    , port_ : Int
+    , ws4sqlPort : Int
+    , env : Node.Environment
+    , dbConnection : Db.Connection
+    }
+
+
+type alias Config =
+    { port_ : Int
+    , ws4sqlPort : Int
+    }
+
+
+defaultConfig : Config
+defaultConfig =
+    { port_ = 3000
+    , ws4sqlPort = 12321
+    }
+
+
+parseArgs : Array String -> Config
+parseArgs args =
+    Array.foldl parseArg { config = defaultConfig, pendingFlag = Nothing } args
+        |> .config
+
+
+parseArg :
+    String
+    -> { config : Config, pendingFlag : Maybe String }
+    -> { config : Config, pendingFlag : Maybe String }
+parseArg arg state =
+    when state.pendingFlag is
+        Just "--port" ->
+            { config =
+                { state.config
+                    | port_ = String.toInt arg |> Maybe.withDefault state.config.port_
+                }
+            , pendingFlag = Nothing
+            }
+
+        Just "--ws4sql-port" ->
+            { config =
+                { state.config
+                    | ws4sqlPort = String.toInt arg |> Maybe.withDefault state.config.ws4sqlPort
+                }
+            , pendingFlag = Nothing
+            }
+
+        Just _ ->
+            { state | pendingFlag = Nothing }
+
+        Nothing ->
+            if arg == "--port" || arg == "--ws4sql-port" then
+                { state | pendingFlag = Just arg }
+            else
+                state
+
+
+
+-- INIT
+
+
+init : Environment -> Init.Task { model : Model, command : Cmd Msg }
+init env =
+    Init.await HttpServer.initialize <| \serverPermission ->
+    Init.await HttpClient.initialize <| \httpClientPermission ->
+        let
+            config =
+                parseArgs env.args
+
+            dbConnection =
+                Db.init httpClientPermission
+                    ("http://localhost:" ++ String.fromInt config.ws4sqlPort ++ "/mynotes")
+
+            serverConfig =
+                { host = "0.0.0.0"
+                , port_ = config.port_
+                }
+        in
+        Node.startProgram
+            { model =
+                { server = Nothing
+                , port_ = config.port_
+                , ws4sqlPort = config.ws4sqlPort
+                , env = env
+                , dbConnection = dbConnection
+                }
+            , command =
+                Cmd.batch
+                    [ initializeSchema dbConnection
+                        |> Task.attempt SchemaInitialized
+                    , HttpServer.createServer serverPermission serverConfig
+                        |> Task.attempt GotServer
+                    ]
+            }
+
+
+
+-- SCHEMA
+
+
+initializeSchema : Db.Connection -> Task.Task Db.Error {}
+initializeSchema connection =
+    Db.execute connection
+        { statement = """
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        , parameters = []
+        }
+        |> Task.map (\_ -> {})
+
+
+
+-- MSG
+
+
+type Msg
+    = GotServer (Result HttpServer.ServerError Server)
+    | GotRequest { request : Request, response : Response }
+    | SchemaInitialized (Result Db.Error {})
+    -- Notes
+    | GotNotes { response : Response, result : Result Db.Error (Array Note) }
+    | GotNote { response : Response, noteId : String, result : Result Db.Error (Maybe Note) }
+    | GotNoteForEdit { response : Response, noteId : String, result : Result Db.Error (Maybe Note) }
+    | NoteCreated { response : Response, result : Result Db.Error {} }
+    | NoteUpdated { response : Response, noteId : Int, result : Result Db.Error {} }
+    | NoteDeleted { response : Response, result : Result Db.Error {} }
+    -- Time
+    | GotTimeForCreate { response : Response, formData : Dict String String, time : Time.Posix }
+    | GotTimeForUpdate { response : Response, noteId : Int, formData : Dict String String, time : Time.Posix }
+
+
+
+-- UPDATE
+
+
+update : Msg -> Model -> { model : Model, command : Cmd Msg }
+update msg model =
+    when msg is
+        GotServer result ->
+            when result is
+                Ok server ->
+                    { model = { model | server = Just server }
+                    , command =
+                        model.port_
+                            |> String.fromInt
+                            |> String.prepend "Server started on port "
+                            |> Stream.Log.line model.env.stdout
+                            |> Task.execute
+                    }
+
+                Err (HttpServer.ServerError error) ->
+                    { model = model
+                    , command =
+                        "Failed to start server: "
+                            ++ error.message
+                            |> Stream.Log.line model.env.stderr
+                            |> Task.map (\_ -> Node.exitWithCode 1)
+                            |> Task.executeCmd
+                    }
+
+        SchemaInitialized result ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command =
+                        Stream.Log.line model.env.stdout "Database schema initialized"
+                            |> Task.execute
+                    }
+
+                Err error ->
+                    { model = model
+                    , command =
+                        "Failed to initialize schema: "
+                            ++ Db.errorToString error
+                            |> Stream.Log.line model.env.stderr
+                            |> Task.execute
+                    }
+
+        GotRequest { request, response } ->
+            handleRequest model request response
+
+        -- Notes
+        GotNotes { response, result } ->
+            when result is
+                Ok notes ->
+                    { model = model
+                    , command = sendHtml response (notesListPage notes)
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        GotNote { response, noteId, result } ->
+            when result is
+                Ok maybeNote ->
+                    when maybeNote is
+                        Just note ->
+                            { model = model
+                            , command = sendHtml response (showNotePage note)
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 404 ("Note not found: " ++ noteId)
+                            }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        GotNoteForEdit { response, noteId, result } ->
+            when result is
+                Ok maybeNote ->
+                    when maybeNote is
+                        Just note ->
+                            { model = model
+                            , command = sendHtml response (editNotePage note)
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 404 ("Note not found: " ++ noteId)
+                            }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Database error: " ++ Db.errorToString error)
+                    }
+
+        NoteCreated { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/notes"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to create note: " ++ Db.errorToString error)
+                    }
+
+        NoteUpdated { response, noteId, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response ("/notes/" ++ String.fromInt noteId)
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to update note: " ++ Db.errorToString error)
+                    }
+
+        NoteDeleted { response, result } ->
+            when result is
+                Ok _ ->
+                    { model = model
+                    , command = redirect response "/notes"
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendError response 500 ("Failed to delete note: " ++ Db.errorToString error)
+                    }
+
+        -- Time
+        GotTimeForCreate { response, formData, time } ->
+            handleCreateNoteWithTime model response formData (Time.posixToMillis time)
+
+        GotTimeForUpdate { response, noteId, formData, time } ->
+            handleUpdateNoteWithTime model response noteId formData (Time.posixToMillis time)
+
+
+
+-- ROUTING
+
+
+handleRequest : Model -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleRequest model request response =
+    when Array.dropFirst 1 (String.split "/" request.url.path) is
+        [ "" ] ->
+            { model = model
+            , command = redirect response "/notes"
+            }
+
+        -- Static files
+        [ "styles.css" ] ->
+            { model = model
+            , command = serveStaticCss response
+            }
+
+        -- Notes
+        [ "notes" ] ->
+            when request.method is
+                HttpServer.GET ->
+                    { model = model
+                    , command =
+                        Note.getAllNotes model.dbConnection
+                            |> Task.attempt (\result -> GotNotes { response = response, result = result })
+                    }
+
+                HttpServer.POST ->
+                    handleCreateNote model request response
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "notes", "new" ] ->
+            when request.method is
+                HttpServer.GET ->
+                    { model = model
+                    , command = sendHtml response newNotePage
+                    }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "notes", idStr, "edit" ] ->
+            when request.method is
+                HttpServer.GET ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Note.getNote model.dbConnection id
+                                    |> Task.attempt (\result -> GotNoteForEdit { response = response, noteId = idStr, result = result })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid note ID"
+                            }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "notes", idStr, "delete" ] ->
+            when request.method is
+                HttpServer.POST ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Note.deleteNote model.dbConnection id
+                                    |> Task.attempt (\result -> NoteDeleted { response = response, result = result })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid note ID"
+                            }
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        [ "notes", idStr ] ->
+            when request.method is
+                HttpServer.GET ->
+                    when String.toInt idStr is
+                        Just id ->
+                            { model = model
+                            , command =
+                                Note.getNote model.dbConnection id
+                                    |> Task.attempt (\result -> GotNote { response = response, noteId = idStr, result = result })
+                            }
+
+                        Nothing ->
+                            { model = model
+                            , command = sendError response 400 "Invalid note ID"
+                            }
+
+                HttpServer.POST ->
+                    handleUpdateNote model idStr request response
+
+                _ ->
+                    { model = model
+                    , command = sendError response 405 "Method not allowed"
+                    }
+
+        _ ->
+            { model = model
+            , command = sendError response 404 "Not found"
+            }
+
+
+
+-- FORM HANDLERS
+
+
+handleCreateNote : Model -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleCreateNote model request response =
+    let
+        formData =
+            parseFormData request.body
+    in
+    { model = model
+    , command =
+        Time.now
+            |> Task.perform (\time -> GotTimeForCreate { response = response, formData = formData, time = time })
+    }
+
+
+handleCreateNoteWithTime : Model -> Response -> Dict String String -> Int -> { model : Model, command : Cmd Msg }
+handleCreateNoteWithTime model response formData nowMs =
+    let
+        maybeTitle =
+            Dict.get "title" formData
+
+        body =
+            Dict.get "body" formData
+                |> Maybe.withDefault ""
+    in
+    when maybeTitle is
+        Just title ->
+            { model = model
+            , command =
+                Note.createNote model.dbConnection
+                    { title = title
+                    , body = body
+                    , createdAt = nowMs
+                    , updatedAt = nowMs
+                    }
+                    |> Task.attempt (\result -> NoteCreated { response = response, result = result })
+            }
+
+        Nothing ->
+            { model = model
+            , command = sendError response 400 "Missing required field: title"
+            }
+
+
+handleUpdateNote : Model -> String -> Request -> Response -> { model : Model, command : Cmd Msg }
+handleUpdateNote model idStr request response =
+    let
+        formData =
+            parseFormData request.body
+    in
+    when String.toInt idStr is
+        Just id ->
+            { model = model
+            , command =
+                Time.now
+                    |> Task.perform (\time -> GotTimeForUpdate { response = response, noteId = id, formData = formData, time = time })
+            }
+
+        Nothing ->
+            { model = model
+            , command = sendError response 400 "Invalid note ID"
+            }
+
+
+handleUpdateNoteWithTime : Model -> Response -> Int -> Dict String String -> Int -> { model : Model, command : Cmd Msg }
+handleUpdateNoteWithTime model response noteId formData nowMs =
+    let
+        maybeTitle =
+            Dict.get "title" formData
+
+        body =
+            Dict.get "body" formData
+                |> Maybe.withDefault ""
+    in
+    when maybeTitle is
+        Just title ->
+            { model = model
+            , command =
+                Note.updateNote model.dbConnection
+                    { id = noteId
+                    , title = title
+                    , body = body
+                    , updatedAt = nowMs
+                    }
+                    |> Task.attempt (\result -> NoteUpdated { response = response, noteId = noteId, result = result })
+            }
+
+        Nothing ->
+            { model = model
+            , command = sendError response 400 "Missing required field: title"
+            }
+
+
+
+-- FORM DATA PARSING
+
+
+parseFormData : Bytes.Bytes -> Dict String String
+parseFormData body =
+    body
+        |> Bytes.toString
+        |> Maybe.withDefault ""
+        |> String.split "&"
+        |> Array.foldl
+            (\pair acc ->
+                when String.split "=" pair is
+                    [ key, value ] ->
+                        Dict.set (decodeFormValue key) (decodeFormValue value) acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+{-| Decode a form value, handling both %XX encoding and + for spaces.
+-}
+decodeFormValue : String -> String
+decodeFormValue value =
+    value
+        |> String.replace "+" " "
+        |> Url.percentDecode
+        |> Maybe.withDefault value
+
+
+
+-- RESPONSE HELPERS
+
+
+sendHtml : Response -> String -> Cmd Msg
+sendHtml response html =
+    response
+        |> Response.setHeader "Content-Type" "text/html; charset=utf-8"
+        |> Response.setBody html
+        |> Response.send
+
+
+sendError : Response -> Int -> String -> Cmd Msg
+sendError response status message =
+    response
+        |> Response.setStatus status
+        |> Response.setHeader "Content-Type" "text/html; charset=utf-8"
+        |> Response.setBody (errorPage status message)
+        |> Response.send
+
+
+redirect : Response -> String -> Cmd Msg
+redirect response path =
+    response
+        |> Response.setStatus 303
+        |> Response.setHeader "Location" path
+        |> Response.send
+
+
+serveStaticCss : Response -> Cmd Msg
+serveStaticCss response =
+    response
+        |> Response.setHeader "Content-Type" "text/css"
+        |> Response.setBody customCss
+        |> Response.send
+
+
+customCss : String
+customCss =
+    """
+/* Just using Kelp defaults for now */
+"""
+
+
+-- VIEWS
+
+
+layout : { title : String, body : Array (Html msg) } -> String
+layout page =
+    "<!DOCTYPE html>"
+        ++ H.toString
+            (H.html []
+                [ H.head []
+                    [ H.meta [ A.charset "utf-8" ]
+                    , H.meta
+                        [ A.name "viewport"
+                        , A.content "width=device-width, initial-scale=1"
+                        ]
+                    , H.title [ H.text page.title ]
+
+                    -- KelpUI
+                    , H.link
+                        [ A.rel "stylesheet"
+                        , A.href "https://cdn.jsdelivr.net/npm/kelpui@1/css/kelp.css"
+                        ]
+
+                    -- Highlight.js
+                    , H.link
+                        [ A.rel "stylesheet"
+                        , A.href "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css"
+                        ]
+
+                    -- Custom
+                    , H.link
+                        [ A.rel "stylesheet"
+                        , A.href "/styles.css"
+                        ]
+                    ]
+                , H.body []
+
+                    -- Main content
+                    [ H.main_ 
+                        [ A.class "container" ]
+                        ([ navigation ] ++ page.body)
+
+                    -- Markdown rendering js
+                    , H.node "script"
+                        [ A.src "https://cdn.jsdelivr.net/npm/marked/marked.min.js" ]
+                        []
+                    , H.node "script" []
+                        [ H.text markdownScript ]
+
+                    -- Syntax highlight js
+                    , H.node "script"
+                        [ A.src "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js" ]
+                        []
+                    ]
+                ]
+            )
+
+
+markdownScript : String
+markdownScript =
+    """
+document.addEventListener('DOMContentLoaded', function() {
+    marked.setOptions({
+        highlight: function(code, lang) {
+            if (lang && hljs.getLanguage(lang)) {
+                return hljs.highlight(code, { language: lang }).value;
+            }
+            return hljs.highlightAuto(code).value;
+        }
+    });
+    document.querySelectorAll('.markdown-body').forEach(function(el) {
+        el.innerHTML = marked.parse(el.textContent);
+    });
+});
+"""
+
+
+navigation : Html msg
+navigation =
+    H.nav [ A.class "navbar" ]
+        [ H.ul []
+            [ H.li [] [ H.a [ A.href "/notes" ] [ H.text "Notes" ] ]
+            , H.li [] [ H.a [ A.href "/notes/new" ] [ H.text "New Note" ] ]
+            ]
+        ]
+
+
+errorPage : Int -> String -> String
+errorPage status message =
+    layout
+        { title = "Error - MyNotes"
+        , body =
+            [ H.h1 [] [ H.text ("Error " ++ String.fromInt status) ]
+            , H.div [ A.class "error" ] [ H.text message ]
+            , H.p [] [ H.a [ A.href "/notes" ] [ H.text "Back to Notes" ] ]
+            ]
+        }
+
+
+
+-- NOTES LIST PAGE
+
+
+notesListPage : Array Note -> String
+notesListPage notes =
+    layout
+        { title = "Notes - MyNotes"
+        , body =
+            [ H.h1 [] [ H.text "My Notes" ]
+            , if Array.isEmpty notes then
+                H.p [] [ H.text "No notes yet. ", H.a [ A.href "/notes/new" ] [ H.text "Create one!" ] ]
+              else
+                H.ul [ A.class "notes-list" ]
+                    (Array.map noteListItem notes)
+            ]
+        }
+
+
+noteListItem : Note -> Html msg
+noteListItem note =
+    let
+        idStr =
+            String.fromInt note.id
+    in
+    H.li []
+        [ H.a [ A.href ("/notes/" ++ idStr) ] [ H.text note.title ]
+        , H.span [ A.class "note-actions" ]
+            [ H.a [ A.href ("/notes/" ++ idStr ++ "/edit") ] [ H.text "Edit" ]
+            , H.form
+                [ A.method "post"
+                , A.action ("/notes/" ++ idStr ++ "/delete")
+                , A.class "inline-form"
+                ]
+                [ H.button [ A.type_ "submit" ] [ H.text "Delete" ]
+                ]
+            ]
+        ]
+
+
+
+-- SHOW NOTE PAGE
+
+
+showNotePage : Note -> String
+showNotePage note =
+    let
+        idStr =
+            String.fromInt note.id
+    in
+    layout
+        { title = note.title ++ " - MyNotes"
+        , body =
+            [ H.h1 [] [ H.text note.title ]
+            , H.p []
+                [ H.a [ A.href ("/notes/" ++ idStr ++ "/edit") ] [ H.text "Edit" ]
+                , H.text " | "
+                , H.a [ A.href "/notes" ] [ H.text "Back to Notes" ]
+                ]
+            , H.div [ A.class "markdown-body" ] [ H.text note.body ]
+            ]
+        }
+
+
+
+-- NEW NOTE PAGE
+
+
+newNotePage : String
+newNotePage =
+    layout
+        { title = "New Note - MyNotes"
+        , body =
+            [ H.h1 [] [ H.text "New Note" ]
+            , H.p [] [ H.a [ A.href "/notes" ] [ H.text "Back to Notes" ] ]
+            , noteForm Nothing
+            ]
+        }
+
+
+
+-- EDIT NOTE PAGE
+
+
+editNotePage : Note -> String
+editNotePage note =
+    layout
+        { title = "Edit Note - MyNotes"
+        , body =
+            [ H.h1 [] [ H.text "Edit Note" ]
+            , H.p [] [ H.a [ A.href "/notes" ] [ H.text "Back to Notes" ] ]
+            , noteForm (Just note)
+            ]
+        }
+
+
+
+-- NOTE FORM
+
+
+noteForm : Maybe Note -> Html msg
+noteForm maybeNote =
+    let
+        action =
+            when maybeNote is
+                Nothing ->
+                    "/notes"
+
+                Just note ->
+                    "/notes/" ++ String.fromInt note.id
+
+        titleValue =
+            maybeNote
+                |> Maybe.map .title
+                |> Maybe.withDefault ""
+
+        bodyValue =
+            maybeNote
+                |> Maybe.map .body
+                |> Maybe.withDefault ""
+
+        buttonText =
+            when maybeNote is
+                Nothing ->
+                    "Create Note"
+
+                Just _ ->
+                    "Update Note"
+    in
+    H.form [ A.method "post", A.action action ]
+        [ H.div []
+            [ H.label [ A.for "title" ] [ H.text "Title" ]
+            , H.input
+                [ A.type_ "text"
+                , A.name "title"
+                , A.id "title"
+                , A.value titleValue
+                , A.attribute "required" "required"
+                ]
+                []
+            ]
+        , H.div []
+            [ H.label [ A.for "body" ] [ H.text "Body (Markdown)" ]
+            , H.textarea
+                [ A.name "body"
+                , A.id "body"
+                ]
+                [ H.text bodyValue ]
+            ]
+        , H.div []
+            [ H.button [ A.type_ "submit" ] [ H.text buttonText ]
+            ]
+        ]
+
+
+
+-- SUBSCRIPTIONS
+
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+    when model.server is
+        Just server ->
+            HttpServer.onRequest server
+                (\req res -> GotRequest { request = req, response = res })
+
+        Nothing ->
+            Sub.none

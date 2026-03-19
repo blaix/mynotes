@@ -1,0 +1,8 @@
+# gren stuff
+.gren/
+
+# db stuff
+data/*.db*
+
+# nix stuff
+result
